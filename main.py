@@ -6,7 +6,16 @@ import zipfile
 import sqlite3
 import pandas as pd
 import shutil
-from tqdm import tqdm
+import ray
+import msgpack
+import setproctitle
+import psutil
+
+import logging
+from progress_bar import ProgressBar
+from ray.dashboard import *
+
+ray.init()
 
 elm_table_main_col_types = {
     "log_hash": "BIGINT",
@@ -62,8 +71,10 @@ def main():
     thin_location_df = main_location_df[["time", "posid", "geom"]]
     conn.close()
 
+    args = []
     print("clone gps start")
-
+    
+    num_ticks = 100
     num_log = 0
     
     for root, dirs, files in os.walk(src_dir):
@@ -72,42 +83,31 @@ def main():
             if not name.endswith("azm"):
                 continue
             num_log += 1
-    
-    max_percent_per_log = 100 / num_log
-    
-    pbar = tqdm(total=100)
-    global prev_progress
-    prev_progress = 0
 
-    def update_progress(progress):
-        global prev_progress
-        new_progress = current_log_index * max_percent_per_log + progress * max_percent_per_log
-        new_progress = round(new_progress, 2)
-        delta = new_progress - prev_progress
-        pbar.update(delta)
-        prev_progress = new_progress
-
-    current_log_index = 0
+    pb = ProgressBar(num_ticks, num_log)
+    actor = pb.actor
 
     for root, dirs, files in os.walk(src_dir):
 
         for name in files:
             if not name.endswith("azm"):
                 continue
-            clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df, main_indoor_locationn_df, thin_location_df, out_dir, update_progress)
-            current_log_index += 1
-
-    pbar.close()
+            args.append(clone_gps.remote(root, name, tmp_dir, main_location_df, main_commander_location_df, main_indoor_locationn_df, thin_location_df, actor, out_dir))
+    
+    
+    pb.print_until_done()
+    ray.get(args)
+    
     print("clone gps done")
 
     assert os.path.isdir(tmp_dir)
     shutil.rmtree(tmp_dir)
     assert not os.path.isdir(tmp_dir)
 
-def clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df, main_indoor_locationn_df, thin_location_df, out_dir, update_progress):
+@ray.remote
+def clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df, main_indoor_locationn_df, thin_location_df, actor, out_dir):
     src_azm_extract_dir = os.path.join(tmp_dir, name)
     src_db = os.path.join(src_azm_extract_dir, "azqdata.db")
-    
 
     with zipfile.ZipFile(os.path.join(root, name), 'r') as zip_ref:
         zip_ref.extractall(src_azm_extract_dir)
@@ -117,13 +117,9 @@ def clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df,
     log_hash = pd.read_sql("select log_hash from logs where log_hash is not null limit 1", conn).iloc[0,0]
     location_df = main_location_df.copy()
     location_df["log_hash"] = log_hash
-    ommander_location_df = main_commander_location_df.copy()
-    ommander_location_df["log_hash"] = log_hash
-    indoor_locationn_df = main_indoor_locationn_df.copy()
-    indoor_locationn_df["log_hash"] = log_hash
-    location_df.to_sql("location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=1000, method="multi")
-    ommander_location_df.to_sql("commander_location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=1000, method="multi")
-    indoor_locationn_df.to_sql("indoor_location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=1000, method="multi")
+    location_df.to_sql("location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False)
+    main_commander_location_df.to_sql("commander_location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False)
+    main_indoor_locationn_df.to_sql("indoor_location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False)
 
     tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'",conn)["name"].tolist()
     valid_tables = []
@@ -131,19 +127,18 @@ def clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df,
         posid_df = pd.read_sql("SELECT name FROM pragma_table_info('{}') WHERE name = 'posid';".format(table),conn)
         if len(posid_df) > 0:
             valid_tables.append(table)
-
+    
     current_table_index = 0
     valid_table_number = len(valid_tables) + 10
 
     for valid_table in valid_tables:
         current_table_index += 1
-        update_progress(current_table_index/valid_table_number)
-
-        if valid_table == "location":
+        actor.update.remote(name, current_table_index/valid_table_number * 100)
+        if valid_table in ["location", "commander_location", "indoor_location"]:
             continue
         df = pd.read_sql("select * from {}".format(valid_table), conn, parse_dates=["time"]).sort_values(by="time").drop(columns=["posid", "geom"])
         df = pd.merge_asof(df, thin_location_df, left_on="time", right_on="time", direction="backward", allow_exact_matches=True)
-        df.to_sql(valid_table, conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=50, method="multi")
+        df.to_sql(valid_table, conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=10, method="multi")
 
     conn.close()
     
@@ -152,7 +147,8 @@ def clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df,
         os.remove(out_azm_path)
     shutil.make_archive(out_azm_path, 'zip', src_azm_extract_dir)
     os.rename(out_azm_path+".zip", out_azm_path)
-    update_progress(1)
+    
+    actor.update.remote(name, 100)
 
 def lat_lon_to_geom(lat, lon):
         if lat is None or lon is None:
