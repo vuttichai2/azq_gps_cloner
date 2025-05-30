@@ -8,25 +8,6 @@ import pandas as pd
 import shutil
 from tqdm import tqdm
 
-elm_table_main_col_types = {
-    "log_hash": "BIGINT",
-    "time": "DATETIME",
-    "modem_time": "DATETIME",
-    "seqid": "INT",
-    "posid": "INT",
-    "netid": "INT",
-    "geom": "BLOB",
-    "event_id": "smallint",
-    "msg_id": "INT",
-    "name": "TEXT",
-    "symbol": "TEXT",
-    "protocol": "TEXT",    
-    "info": "TEXT",
-    "detail": "TEXT",
-    "detail_hex": "TEXT",
-    "detail_str": "TEXT",
-}
-
 main_azm = sys.argv[1]
 src_dir = sys.argv[2]
 out_dir = sys.argv[3]
@@ -121,9 +102,9 @@ def clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df,
     ommander_location_df["log_hash"] = log_hash
     indoor_locationn_df = main_indoor_locationn_df.copy()
     indoor_locationn_df["log_hash"] = log_hash
-    location_df.to_sql("location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=1000, method="multi")
-    ommander_location_df.to_sql("commander_location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=1000, method="multi")
-    indoor_locationn_df.to_sql("indoor_location", conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=1000, method="multi")
+    location_df.to_sql("location", conn, if_exists="replace", dtype=get_existing_sqlite_table_col_types_dict("location", conn), index=False, chunksize=1000, method="multi")
+    ommander_location_df.to_sql("commander_location", conn, if_exists="replace", dtype=get_existing_sqlite_table_col_types_dict("commander_location", conn), index=False, chunksize=1000, method="multi")
+    indoor_locationn_df.to_sql("indoor_location", conn, if_exists="replace", dtype=get_existing_sqlite_table_col_types_dict("indoor_location", conn), index=False, chunksize=1000, method="multi")
 
     tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'",conn)["name"].tolist()
     valid_tables = []
@@ -143,7 +124,21 @@ def clone_gps(root, name, tmp_dir, main_location_df, main_commander_location_df,
             continue
         df = pd.read_sql("select * from {}".format(valid_table), conn, parse_dates=["time"]).sort_values(by="time").drop(columns=["posid", "geom"])
         df = pd.merge_asof(df, thin_location_df, left_on="time", right_on="time", direction="backward", allow_exact_matches=True)
-        df.to_sql(valid_table, conn, if_exists="replace", dtype=elm_table_main_col_types, index=False, chunksize=50, method="multi")
+        update_sql = f"UPDATE {valid_table} SET posid = ?, geom = ? WHERE seqid = ?"
+        values_list = [
+            (row["posid"], safe_bytes(row["geom"]), row["seqid"])
+            for _, row in df.iterrows()
+        ]
+        
+        try:
+            conn.execute("BEGIN TRANSACTION")
+            cursor = conn.cursor()
+            cursor.executemany(update_sql, values_list)
+            conn.commit()
+            # print(f"Table {valid_table} Updated {len(values_list)} rows successfully.")
+        except Exception as e:
+            conn.rollback()
+            # print("Error during update:", e)
 
     conn.close()
     
@@ -180,4 +175,17 @@ def lat_lon_to_geom(lat, lon):
         geomBlob[59] = 0xfe
         return geomBlob
 
+def get_existing_sqlite_table_col_types_dict(table, dbcon):
+    existing_table_col_types_df = pd.read_sql("PRAGMA table_info({});".format(table), dbcon)[['name', 'type']]
+    existing_table_col_types_dict = {}
+    for _, row in existing_table_col_types_df.iterrows():
+        existing_table_col_types_dict[row['name']] = row['type']
+    return existing_table_col_types_dict
+
+def safe_bytes(val):
+    try:
+        return bytes(val)
+    except (TypeError, ValueError):
+        return bytes()
+    
 main()
